@@ -1,0 +1,210 @@
+---
+title: "2 pass STAR aligner for Gene Expression"
+author: "Amy Paguirigan"
+date: "7/11/2019"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+# Install Required Packages
+
+## For Local Use
+```{r}
+devtools::install_github('FredHutch/tgR@v0.2.2')
+devtools::install_github('FredHutch/tgR')
+devtools::install_github("dtenenba/aws.s3", ref="feature/add-tagging-functions")
+```
+
+## For Rhino Use
+```{r}
+devtools::install_github('FredHutch/tgR', lib = "~/R/x86_64-pc-linux-gnu-library/3.5") # Rhino
+devtools::install_github("dtenenba/aws.s3", ref="feature/add-tagging-functions", lib = "~/R/x86_64-pc-linux-gnu-library/3.5")
+```
+
+# Load Packages
+```{r}
+library(tidyverse); library(aws.s3); library(tgR)
+```
+
+# Set Credentials (run one line)
+```{r}
+setCreds(tokenSet = "file", path = "~/Documents/GitHubRepos/paguirigan.R") #DVTC
+setCreds(tokenSet = "file", path = "~/Documents/github/paguirigan.R") #laptop
+setCreds(tokenSet = "file", path = "~/cred/paguirigan.R") #rhino
+```
+
+# Pull S3 Inventory and Annotate
+```{r}
+tags <- listS3Objects(bucket = "fh-pi-paguirigan-a")
+annotations <- redcapPull(domain = "all", DAG = "paguirigana", harmonizedOnly = TRUE)
+monsterMash <- dplyr::left_join(tags, annotations)
+```
+
+# Filter Inventory for Workflow Input Data
+
+```{r}
+subData <- monsterMash %>% filter(genomics_types == "rnaseq") %>% Filter(function(x)!all(is.na(x)), .) %>% unique()
+
+justFastqs <- monsterMash %>% 
+    filter(stage == "raw" & grepl("*fastq.gz", key)==T & genomics_types == "rnaseq") %>%
+    Filter(function(x)!all(is.na(x)), .) %>% unique()
+justFastqs$prefix <- paste0("s3://fh-pi-paguirigan-a/", justFastqs$key)
+
+justFastqs$fastqDirection <- if_else(grepl("*_R1_*", justFastqs$key)==T, "R1", 
+                                     if_else(grepl("*_R2_*", justFastqs$key)==T, "R2", "NA"))
+justFastqs <- justFastqs %>% 
+    group_by(molecular_id, fastqDirection) %>% 
+    arrange(prefix) %>% 
+    mutate(fastqString = paste(prefix, collapse = ","))
+
+manifest <- justFastqs %>% 
+    select(molecular_id, omics_sample_name, fastqDirection, fastqString) %>% 
+    distinct() %>% 
+    spread(fastqDirection, fastqString) 
+#manifest <- rename(manifest, "readLength" = "seq_readlength")
+```
+
+
+# Prefilter manifest if needed
+```{r}
+manifest <- manifest[1,]
+```
+
+# Name and Ship Batch File
+```{r}
+batchFileName <- paste0("cromwell-manifests/",format(Sys.Date(), "%Y-%m-%d-"), "STAR-batchofOne.tsv")
+paste0("s3://fh-pi-paguirigan-a-genomicsrepo/", batchFileName)
+s3write_using(manifest,
+              FUN = write.table, quote = F, row.names = F, sep = "\t",
+              object = batchFileName,
+              bucket = "fh-pi-paguirigan-a-genomicsrepo")
+thisManifest <- "cromwell-manifests/2019-07-11-STAR-batchofOne.tsv"
+```
+
+# Submit Job to Cromwell
+####### Note: setwd to location of workflow files: setwd("~/XXXXXXX/tgWorkflow/WDL/whereever")
+```{r}
+thisJob <- cromwellSubmitBatch(WDL = "testingWorkflow/deoppilate.wdl",
+                    Params = "testingWorkflow/deoppilate_parameters.json",
+                    Batch = "testingWorkflow/deoppilate_batch.json",
+                    Options = "testingWorkflow/workflow-options.json",
+                    Labels = data.frame("workflowType" = "testing", "investigator" = "paguirigana"))
+thisOne <- thisJob$id; thisOne
+```
+
+```{r}
+thisOne <- "0ff86125-743c-4581-a6c4-6005dd32a554" # First batch of one.
+
+thisOne <- "101776e6-f684-482d-8be9-522e3ce41508" # Fixed fastq names so there was an output!!
+thisOne <- "3e583fb7-6b23-4349-8ad5-0f9a015922e8" # fixed the sdjbOVerhang to be 100 like the reference???
+thisOne <- "85859bcb-4a98-46a7-94fa-9fe9a66916e8" # Direct resubmission of the previous job b/c it was aborted outside of Cromwell
+thisOne <- "eee0244b-320a-4b3e-b108-91d74cc3464c" # requested more resoruces to get a different ec2 type
+```
+
+
+# Monitor Running Jobs
+```{r}
+w <- cromwellWorkflow(thisOne)
+c <- cromwellCall(thisOne); c %>% group_by(executionStatus, callName) %>% summarize(status = n())
+ca <- cromwellCache(thisOne); ca %>% group_by(callCaching.hit, callName) %>% summarize(hits = n())
+butWhy <- left_join(cromwellCall(thisOne) %>% mutate_all(as.character), 
+                    cromwellCache(thisOne) %>% mutate_all(as.character)); butWhy %>% group_by(callName, executionStatus, callCaching.hit) %>% summarize(hits = n()) %>% arrange(desc(executionStatus))
+f <- cromwellFailures(thisOne)
+#abort <- cromwellAbort(thisOne) # Careful with this
+WTF <- cromwellGlob(thisOne)
+```
+
+# Delete files in S3 related to crap workflows
+```{r}
+dir <- paste0("cromwell-output/STAR2Pass/", thisOne, "/")
+delete_object(
+  object = dir,
+  bucket = "fh-pi-paguirigan-a-genomicsrepo"
+)
+```
+
+
+
+# Output Processing
+```{r}
+out <- cromwellOutputs(thisOne) 
+batchFile <- s3read_using(FUN = read.delim, stringsAsFactors = F,
+                           object = thisManifest,
+                           bucket = "fh-pi-paguirigan-a-genomicsrepo")
+batchFile$shardIndex <- as.character(seq(from = 0, to = nrow(batchFile)-1, by = 1))
+annotatedOutputs <- inner_join(batchFile, out, by = c("shardIndex")) # if no molecular_id
+copyNTag <- annotatedOutputs %>%
+  select(molecular_id, workflowOutputType, s3URL, s3Prefix, workflow_id, workflowName, s3Bucket) %>%
+  rename("workflowID" = "workflow_id")
+copyNTag$s3DestinationPrefix <- gsub( "cromwell-output/", "tg/TGR-Analyses/",gsub("call-[^/]*/", "", copyNTag$s3Prefix))
+copyNTag$s3DestinationBucket <- "fh-pi-paguirigan-a"
+copyNTag$stage <- "processed"
+copyNTag[10,]
+```
+
+# Copy Outputs and Tag
+```{r}
+colnames(copyNTag)
+#Only keep columns you need or want to use as tags
+readyToRoll <- copyNTag %>% select(s3Prefix, s3Bucket, s3DestinationPrefix, s3DestinationBucket, molecular_id, stage, workflowID, workflowName); colnames(readyToRoll)
+
+QuitePossibly <- prep_s3_copy_and_tag(readyToRoll); QuitePossibly[1]
+
+future::plan(strategy = multiprocess)
+furrr::future_map(QuitePossibly, function(x) {
+  s3_copy_and_tag(fromBucket = x$s3Bucket,
+                  fromPrefix = x$s3Prefix,
+                  toBucket = x$s3DestinationBucket,
+                  toPrefix = x$s3DestinationPrefix,
+                  tagList = x$tagSet)
+  print(x$s3DestinationPrefix)
+})
+```
+
+# For Large file copies you have to use the command line
+Change WD to directory on Fast where the output-copy-and-tag.sh script (and arrayjob.sh) are saved for this project.  
+```{r}
+write.table(readyToRoll, file = "2019-06-28-breedbate-cleanCalling-HALO-goodQC.txt",
+            sep = " ", na = "", row.names = F, col.names = F, quote = F)
+```
+
+
+```{bash}
+ssh apaguiri@rhino
+module load awscli
+sbatch --job-name 2019-06-18-zoanthropy-LILACtest-copy.txt arrayjob.sh
+bash monitorjobs.sh <jobID>
+```
+## FINAL NOTE:  copy the WDL used and any parameter files to S3 into the final data directory too!!!!
+
+
+
+
+# Memory testing snippets
+```{r}
+thisID <- "a7bb74fd-e602-4217-88d1-b6917796358c"
+withMultipler2 <- "e4502446-444b-4d03-9ee0-36878f10ba4c"
+withMultiplierHalf <- "32e14d98-d0ca-46f4-94f1-d265c174889e"
+
+adjusted1 <- "c87a7ef3-af25-4588-bbca-002320a19340"
+adjusted2 <- "522b1a72-e19b-4e21-a00d-935318722f59"
+magic <- "1ec38d0b-afc4-4cd5-90f1-f015395d6e36"
+
+oneX <- cromwellCall(adjusted1)
+durationOneX <- oneX %>% select(callName, shardIndex, jobDuration, memory) %>%
+  rename("oneXDuration" = "jobDuration", "oneXmemory" = "memory")
+
+twoX <- cromwellCall(adjusted2)
+durationTwoX <- twoX %>% select(callName, shardIndex, jobDuration, memory) %>%
+  rename("twoXDuration" = "jobDuration", "twoXmemory" = "memory")
+comparisonTwo <- left_join(durationOneX, durationTwoX, by = c("callName", "shardIndex")) %>%
+  mutate(twoXImprovement = oneXDuration - twoXDuration)
+
+overall <- full_join(durationTwoX, durationOneX)
+overall <- overall %>% mutate(twoImp = oneXDuration-twoXDuration)
+
+overall %>% group_by(callName) %>% summarise(meanTwo = mean(twoImp, na.rm = T))
+```
+
+
+
