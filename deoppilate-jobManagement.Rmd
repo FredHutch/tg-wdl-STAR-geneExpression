@@ -75,7 +75,6 @@ thisManifest <- "s3://fh-pi-paguirigan-a-genomicsrepo/cromwell-manifests/FredHut
 ```
 
 ```{r}
-Sys.setenv("CROMWELLURL" = "http://gizmok36:8000")
 workflowPath <- "./workflows/tg-wdl-STAR-geneExpression/"
 list.files(path = workflowPath)
 womtoolValidate(paste(workflowPath, "STAR2Pass-Modules.wdl" , sep = "/"))
