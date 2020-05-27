@@ -1,0 +1,100 @@
+---
+title: "2 pass STAR aligner for Gene Expression"
+author: "Amy Paguirigan"
+date: "5/13/20"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+# Install Required Packages
+
+## For Local Use
+```{r}
+devtools::install_github('FredHutch/tgR@v0.2.2')
+devtools::install_github('FredHutch/tgR')
+devtools::install_github("dtenenba/aws.s3", ref="feature/add-tagging-functions")
+```
+
+# Load Packages
+```{r}
+library(tidyverse); library(aws.s3); library(tgR); library(fh.wdlR)
+```
+
+# Set Credentials 
+```{r}
+setCreds(tokenSet = "file", path = "~/github/cred/paguirigan.R")
+```
+
+# Pull S3 Inventory and Annotate
+```{r}
+tags <- listS3Objects(bucket = "fh-pi-radich-j")
+annotations <- tgrAnnotate(DAG = "radichj")
+monsterMash <- dplyr::left_join(tags, annotations)
+```
+
+# Filter Inventory for Workflow Input Data
+
+```{r}
+subData <- monsterMash %>% filter(genomics_type == "rnaseq") %>% dropWhen()
+
+justFastqs <- monsterMash %>% 
+    filter(stage == "raw" & grepl("*fastq.gz", key)==T & genomics_type == "rnaseq") %>% dropWhen()
+
+justFastqs$prefix <- paste0("s3://fh-pi-radich-j/", justFastqs$key)
+
+justFastqs$fastqDirection <- if_else(grepl(".*[_|.]R1[_|.].*", justFastqs$key)==T, "R1", 
+                                     if_else(grepl(".*[_|.]R2[_|.].*", justFastqs$key)==T, "R2", "NA"))
+justFastqs <- justFastqs %>% 
+    group_by(molecular_id, fastqDirection) %>% 
+    arrange(prefix) %>% 
+    mutate(fastqString = paste(prefix, collapse = ","))
+
+manifest <- justFastqs %>% 
+    select(molecular_id, omics_sample_name, fastqDirection, fastqString) %>% 
+    distinct() %>% 
+    spread(fastqDirection, fastqString) 
+#manifest <- rename(manifest, "readLength" = "seq_readlength")
+```
+
+
+# Prefilter manifest if needed
+```{r}
+manifest <- manifest[1,]
+```
+
+# Name and Ship Batch File
+```{r}
+repoName <- "FredHutch/tg-wdl-STAR-geneExpression"
+batchFileName <- paste0("cromwell-manifests/",repoName, "/", format(Sys.Date(), "%Y-%m-%d-"), "Deeg-STAR-batchofOne.tsv")
+paste0("s3://fh-pi-paguirigan-a-genomicsrepo/", batchFileName)
+s3write_using(manifest,
+              FUN = write.table, quote = F, row.names = F, sep = "\t",
+              object = batchFileName,
+              bucket = "fh-pi-paguirigan-a-genomicsrepo")
+thisManifest <- "s3://fh-pi-paguirigan-a-genomicsrepo/cromwell-manifests/FredHutch/tg-wdl-STAR-geneExpression/2020-05-13-Deeg-STAR-batchofOne.tsv"
+```
+
+```{r}
+Sys.setenv("CROMWELLURL" = "http://gizmok36:8000")
+workflowPath <- "./workflows/tg-wdl-STAR-geneExpression/"
+list.files(path = workflowPath)
+womtoolValidate(paste(workflowPath, "STAR2Pass-Modules.wdl" , sep = "/"))
+
+thisJob <- cromwellSubmitBatch(
+  WDL = paste(workflowPath, "STAR2Pass-Modules.wdl" , sep = "/"),
+  Params = paste(workflowPath, "deoppilate_parameters-human-hg38.json", sep = "/"),
+  Batch = paste(workflowPath, "deoppilate_batch.json" , sep = "/"),
+  Options = paste(workflowPath, "continueWhile-callcachingOn.json", sep = "/"))
+
+thisOne <- thisJob$id; thisOne
+thisOne <- "dd67b35b-9e11-43ed-a906-1170a77adf4c"
+```
+
+## Workflow level metadata
+```{r}
+w <- cromwellWorkflow(thisOne); w$status
+WTF <- cromwellGlob(thisOne); WTF[["failures"]]
+c <- cromwellCall(thisOne); c %>% group_by(executionStatus, callName) %>% summarize(status = n())
+ca <- cromwellCache(thisOne); ca %>% group_by(callCaching.hit, callName) %>% summarize(hits = n())
+f <- cromwellFailures(thisOne); f
+```
